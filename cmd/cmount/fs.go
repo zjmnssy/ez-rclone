@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/zjmnssy/ezlog"
+
 	"github.com/rclone/rclone/cmd/mountlib"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/fserrors"
@@ -182,6 +184,7 @@ func (fsys *FS) stat(node vfs.Node, stat *fuse.Stat_t) (errc int) {
 // Init is called after the filesystem is ready
 func (fsys *FS) Init() {
 	defer log.Trace(fsys.f, "")("")
+	ezlog.Criticalf("[local] filesystem is ready")
 	close(fsys.ready)
 }
 
@@ -190,6 +193,7 @@ func (fsys *FS) Init() {
 // Destroy call).
 func (fsys *FS) Destroy() {
 	defer log.Trace(fsys.f, "")("")
+	ezlog.Criticalf("[local] filesystem is destory")
 	atomic.StoreInt32(&fsys.destroyed, 1)
 }
 
@@ -290,6 +294,7 @@ func (fsys *FS) Statfs(path string, stat *fuse.Statfs_t) (errc int) {
 	mountlib.ClipBlocks(&stat.Blocks)
 	mountlib.ClipBlocks(&stat.Bfree)
 	mountlib.ClipBlocks(&stat.Bavail)
+	//ezlog.Criticalf("[local] Statfs")
 	return 0
 }
 
@@ -326,6 +331,7 @@ func (fsys *FS) Open(path string, flags int) (errc int, fh uint64) {
 // CreateEx creates and opens a file.
 func (fsys *FS) CreateEx(filePath string, mode uint32, fi *fuse.FileInfo_t) (errc int) {
 	defer log.Trace(filePath, "flags=0x%X, mode=0%o", fi.Flags, mode)("errc=%d, fh=0x%X", &errc, &fi.Fh)
+	ezlog.Criticalf("[local] CreateEx filePath=%s", filePath)
 	fi.Fh = fhUnset
 	leaf, parentDir, errc := fsys.lookupParentDir(filePath)
 	if errc != 0 {
@@ -357,6 +363,7 @@ func (fsys *FS) Create(filePath string, flags int, mode uint32) (errc int, fh ui
 // Truncate truncates a file to size
 func (fsys *FS) Truncate(path string, size int64, fh uint64) (errc int) {
 	defer log.Trace(path, "size=%d, fh=0x%X", size, fh)("errc=%d", &errc)
+	ezlog.Criticalf("[local] Truncate filePath=%s", path)
 	node, handle, errc := fsys.getNode(path, fh)
 	if errc != 0 {
 		return errc
@@ -391,6 +398,7 @@ func (fsys *FS) Read(path string, buff []byte, ofst int64, fh uint64) (n int) {
 // Write data to file handle
 func (fsys *FS) Write(path string, buff []byte, ofst int64, fh uint64) (n int) {
 	defer log.Trace(path, "ofst=%d, fh=0x%X", ofst, fh)("n=%d", &n)
+	ezlog.Criticalf("[local] Write filePath=%s", path)
 	handle, errc := fsys.getHandle(fh)
 	if errc != 0 {
 		return errc
@@ -426,6 +434,7 @@ func (fsys *FS) Release(path string, fh uint64) (errc int) {
 // Unlink removes a file.
 func (fsys *FS) Unlink(filePath string) (errc int) {
 	defer log.Trace(filePath, "")("errc=%d", &errc)
+	ezlog.Criticalf("[local] Unlink filePath=%s", filePath)
 	leaf, parentDir, errc := fsys.lookupParentDir(filePath)
 	if errc != 0 {
 		return errc
@@ -436,6 +445,7 @@ func (fsys *FS) Unlink(filePath string) (errc int) {
 // Mkdir creates a directory.
 func (fsys *FS) Mkdir(dirPath string, mode uint32) (errc int) {
 	defer log.Trace(dirPath, "mode=0%o", mode)("errc=%d", &errc)
+	ezlog.Criticalf("[local] Mkdir filePath=%s", dirPath)
 	leaf, parentDir, errc := fsys.lookupParentDir(dirPath)
 	if errc != 0 {
 		return errc
@@ -447,6 +457,7 @@ func (fsys *FS) Mkdir(dirPath string, mode uint32) (errc int) {
 // Rmdir removes a directory
 func (fsys *FS) Rmdir(dirPath string) (errc int) {
 	defer log.Trace(dirPath, "")("errc=%d", &errc)
+	ezlog.Criticalf("[local] Rmdir filePath=%s", dirPath)
 	leaf, parentDir, errc := fsys.lookupParentDir(dirPath)
 	if errc != 0 {
 		return errc
@@ -457,6 +468,7 @@ func (fsys *FS) Rmdir(dirPath string) (errc int) {
 // Rename renames a file.
 func (fsys *FS) Rename(oldPath string, newPath string) (errc int) {
 	defer log.Trace(oldPath, "newPath=%q", newPath)("errc=%d", &errc)
+	ezlog.Criticalf("[local] Rename oldPath=%s => newPath=%s", oldPath, newPath)
 	return translateError(fsys.VFS.Rename(oldPath, newPath))
 }
 
@@ -468,6 +480,7 @@ var invalidDateCutoff = time.Date(1601, 1, 2, 0, 0, 0, 0, time.UTC)
 // Utimens changes the access and modification times of a file.
 func (fsys *FS) Utimens(path string, tmsp []fuse.Timespec) (errc int) {
 	defer log.Trace(path, "tmsp=%+v", tmsp)("errc=%d", &errc)
+	ezlog.Criticalf("[local] Utimens filePath=%s", path)
 	node, errc := fsys.lookupNode(path)
 	if errc != 0 {
 		return errc

@@ -14,6 +14,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rclone/rclone/fs/sqlcache"
+
 	sysdnotify "github.com/iguanesolutions/go-systemd/v5/notify"
 	"github.com/rclone/rclone/fs"
 	fscache "github.com/rclone/rclone/fs/cache"
@@ -61,6 +63,7 @@ type Cache struct {
 	kickerMu      sync.Mutex       // mutex for cleanerKicked
 	kick          chan struct{}    // channel for kicking clear to start
 
+	isFirstBeginSqlCache bool
 }
 
 // AddVirtualFn if registered by the WithAddVirtual method, can be
@@ -128,11 +131,34 @@ func New(ctx context.Context, fremote fs.Fs, opt *vfscommon.Options, avFn AddVir
 		avFn:       avFn,
 	}
 
+	dbFile := parentOSPath + sqlcache.SqlMetaDatabaseName
+	_, err = os.Stat(dbFile)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			c.isFirstBeginSqlCache = true
+		} else {
+			fs.Errorf(nil, "stat %s failed=%s", dbFile, err)
+			return nil, fmt.Errorf("failed to load dbFile: %w", err)
+		}
+	}
+
+	err = sqlcache.Init(dbFile)
+	if err != nil {
+		fs.Errorf(nil, "OpenDB %s failed=%s", dbFile, err)
+		return nil, err
+	}
+
 	// load in the cache and metadata off disk
-	err = c.reload(ctx)
+	err = c.sqlCacheReload(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load cache: %w", err)
 	}
+
+	// load in the cache and metadata off disk
+	//err = c.reload(ctx)
+	//if err != nil {
+	//	return nil, fmt.Errorf("failed to load cache: %w", err)
+	//}
 
 	// Remove any empty directories
 	c.purgeEmptyDirs("", true)
@@ -201,11 +227,21 @@ func (c *Cache) createItemDir(name string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to create data cache item directory: %w", err)
 	}
-	parentPathMeta := c.toOSPathMeta(parent)
-	err = createDir(parentPathMeta)
+	//parentPathMeta := c.toOSPathMeta(parent)
+	//err = createDir(parentPathMeta)
+	//if err != nil {
+	//	return "", fmt.Errorf("failed to create metadata cache item directory: %w", err)
+	//}
+	err = sqlcache.AddItem(parent, fs.EntryDirectory)
 	if err != nil {
-		return "", fmt.Errorf("failed to create metadata cache item directory: %w", err)
+		return "", fmt.Errorf("failed to add sqlcache directory: %w", err)
 	}
+
+	err = sqlcache.AddMeta(parent, fs.EntryDirectory, []byte(""))
+	if err != nil {
+		return "", fmt.Errorf("failed to add sqlcache directory: %w", err)
+	}
+
 	return c.toOSPath(name), nil
 }
 
@@ -454,6 +490,16 @@ func (c *Cache) DirRename(oldDirName string, newDirName string) (err error) {
 	// Old path should be empty now so remove it
 	c.purgeEmptyDirs(oldDirName[:len(oldDirName)-1], false)
 
+	err = sqlcache.RenameDirItem(oldDirName, newDirName)
+	if err != nil {
+		return err
+	}
+
+	err = sqlcache.RenameDirMeta(oldDirName, newDirName)
+	if err != nil {
+		return err
+	}
+
 	fs.Infof(oldDirName, "vfs cache: renamed dir in cache to %q", newDirName)
 	return err
 }
@@ -489,6 +535,14 @@ func (c *Cache) CleanUp() error {
 	if err1 != nil {
 		return err1
 	}
+
+	if err2 == nil {
+		err := sqlcache.CleanAllCache()
+		if err != nil {
+			return err
+		}
+	}
+
 	return err2
 }
 
@@ -537,6 +591,101 @@ func (c *Cache) reload(ctx context.Context) error {
 			return fmt.Errorf("failed to walk cache %q: %w", dir, err)
 		}
 	}
+	return nil
+}
+
+// sqlCacheReload walks the cache loading metadata files
+//
+// It iterates the files first then metadata trees. It doesn't expect
+// to find any new items iterating the metadata but it will clear up
+// orphan files.
+func (c *Cache) sqlCacheReload(ctx context.Context) error {
+	if c.isFirstBeginSqlCache {
+		for _, dir := range []string{c.root} {
+			err := c.walk(dir, func(osPath string, fi os.FileInfo, name string) error {
+				if fi.IsDir() {
+					sqlcache.AddItem(name, fs.EntryDirectory)
+					sqlcache.AddMeta(name, fs.EntryDirectory, []byte{})
+					return nil
+				}
+				item, found := c.get(name)
+				if !found {
+					err := item.reload(ctx)
+					if err != nil {
+						fs.Errorf(name, "vfs cache: failed to reload item: %v", err)
+					}
+				}
+
+				sqlcache.AddItem(name, fs.EntryObject)
+
+				return nil
+			})
+			if err != nil {
+				return fmt.Errorf("failed to walk cache %q: %w", dir, err)
+			}
+		}
+
+		for _, dir := range []string{c.metaRoot} {
+			err := c.walk(dir, func(osPath string, fi os.FileInfo, name string) error {
+				if fi.IsDir() {
+					return nil
+				}
+				item, found := c.get(name)
+				if !found {
+					err := item.reload(ctx)
+					if err != nil {
+						fs.Errorf(name, "vfs cache: failed to reload item: %v", err)
+					}
+				}
+				return nil
+			})
+			if err != nil {
+				return fmt.Errorf("failed to walk cache %q: %w", dir, err)
+			}
+		}
+
+		return nil
+	}
+
+	allItemList, err := sqlcache.GetAllItem()
+	if err != nil {
+		return err
+	}
+
+	for _, sqlItem := range allItemList {
+		if sqlItem.Type == int32(fs.EntryDirectory) {
+			continue
+		}
+
+		item, found := c.get(sqlItem.Path)
+		if !found {
+			err := item.reload(ctx)
+			if err != nil {
+				fs.Errorf(sqlItem.Path, "vfs cache: failed to reload item: %v", err)
+			}
+		}
+	}
+
+	allMetaList, err := sqlcache.GetAllMeta()
+	if err != nil {
+		return err
+	}
+	for _, sqlMeta := range allMetaList {
+		if sqlMeta.Type == int32(fs.EntryDirectory) {
+			continue
+		}
+
+		item, found := c.get(sqlMeta.Path)
+		if !found {
+			err := item.reload(ctx)
+			if err != nil {
+				fs.Errorf(sqlMeta.Path, "vfs cache: failed to reload item: %v", err)
+			}
+		}
+	}
+
+	c.isFirstBeginSqlCache = false
+
 	return nil
 }
 
@@ -674,10 +823,10 @@ func (c *Cache) purgeEmptyDirs(dir string, leaveRoot bool) {
 	if err != nil {
 		fs.Errorf(c.fcache, "vfs cache: failed to remove empty directories from cache path %q: %v", dir, err)
 	}
-	err = operations.Rmdirs(ctx, c.fcacheMeta, dir, leaveRoot)
-	if err != nil {
-		fs.Errorf(c.fcache, "vfs cache: failed to remove empty directories from metadata cache path %q: %v", dir, err)
-	}
+	//err = operations.Rmdirs(ctx, c.fcacheMeta, dir, leaveRoot)
+	//if err != nil {
+	//	fs.Errorf(c.fcache, "vfs cache: failed to remove empty directories from metadata cache path %q: %v", dir, err)
+	//}
 }
 
 // updateUsed updates c.used so it is accurate

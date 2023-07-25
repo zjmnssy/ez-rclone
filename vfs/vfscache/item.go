@@ -2,13 +2,16 @@ package vfscache
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"sync"
 	"time"
+
+	jsoniter "github.com/json-iterator/go"
+	"github.com/rclone/rclone/fs/sqlcache"
+	"gorm.io/gorm"
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/fserrors"
@@ -186,39 +189,163 @@ func (item *Item) getDiskSize() int64 {
 func (item *Item) load() (exists bool, err error) {
 	item.mu.Lock()
 	defer item.mu.Unlock()
-	osPathMeta := item.c.toOSPathMeta(item.name) // No locking in Cache
-	in, err := os.Open(osPathMeta)
+
+	var json = jsoniter.ConfigCompatibleWithStandardLibrary
+
+	metaInfo, err := sqlcache.GetMeta(item.name, fs.EntryObject)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, gorm.ErrRecordNotFound) && item.c.isFirstBeginSqlCache {
+			// 兼容旧版本客户端升级，有的meta信息在meta文件
+			osPathMeta := item.c.toOSPathMeta(item.name) // No locking in Cache
+			in, err := os.Open(osPathMeta)
+			if err != nil {
+				if os.IsNotExist(err) {
+					return false, err
+				}
+				return true, fmt.Errorf("vfs cache item: failed to read metadata: %w", err)
+			}
+			defer fs.CheckClose(in, &err)
+			decoder := json.NewDecoder(in)
+			err = decoder.Decode(&item.info)
+			if err != nil {
+				return true, fmt.Errorf("vfs cache item: corrupt metadata: %w", err)
+			}
+
+			infoByte, err := json.Marshal(item.info)
+			if err != nil {
+				return true, fmt.Errorf("vfs cache item: corrupt metadata: %w", err)
+			}
+
+			err = sqlcache.UpsertMeta(item.name, fs.EntryObject, infoByte)
+			if err != nil {
+				return true, fmt.Errorf("vfs cache item: corrupt metadata: %w", err)
+			}
+
+			return true, nil
+		} else if errors.Is(err, gorm.ErrRecordNotFound) && !item.c.isFirstBeginSqlCache {
 			return false, err
 		}
+
 		return true, fmt.Errorf("vfs cache item: failed to read metadata: %w", err)
 	}
-	defer fs.CheckClose(in, &err)
-	decoder := json.NewDecoder(in)
-	err = decoder.Decode(&item.info)
+
+	err = json.Unmarshal(metaInfo.Info, &item.info)
 	if err != nil {
 		return true, fmt.Errorf("vfs cache item: corrupt metadata: %w", err)
 	}
+
+	//osPathMeta := item.c.toOSPathMeta(item.name) // No locking in Cache
+	//in, err := os.Open(osPathMeta)
+	//if err != nil {
+	//	if os.IsNotExist(err) {
+	//		return false, err
+	//	}
+	//	return true, fmt.Errorf("vfs cache item: failed to read metadata: %w", err)
+	//}
+	//defer fs.CheckClose(in, &err)
+	//decoder := json.NewDecoder(in)
+	//err = decoder.Decode(&item.info)
+	//if err != nil {
+	//	return true, fmt.Errorf("vfs cache item: corrupt metadata: %w", err)
+	//}
+
 	return true, nil
+}
+
+// load reads an item from the disk or returns nil if not found
+func (item *Item) loadInfo() (info Info, exists bool, err error) {
+	item.mu.Lock()
+	defer item.mu.Unlock()
+	/*
+		osPathMeta := item.c.toOSPathMeta(item.name) // No locking in Cache
+		in, err := os.Open(osPathMeta)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return info, false, err
+			}
+			return info, true, fmt.Errorf("vfs cache item failed to read metadata: %w", err)
+		}
+		defer fs.CheckClose(in, &err)
+		decoder := json.NewDecoder(in)
+		err = decoder.Decode(&info)
+		if err != nil {
+			return info, true, fmt.Errorf("vfs cache item corrupt metadata: %w", err)
+		}
+	*/
+
+	var json = jsoniter.ConfigCompatibleWithStandardLibrary
+
+	metaInfo, err := sqlcache.GetMeta(item.name, fs.EntryObject)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			// 兼容旧版本客户端升级，有的meta信息在meta文件
+			osPathMeta := item.c.toOSPathMeta(item.name) // No locking in Cache
+			in, err := os.Open(osPathMeta)
+			if err != nil {
+				if os.IsNotExist(err) {
+					return info, false, err
+				}
+				return info, true, fmt.Errorf("vfs cache item failed to read metadata: %w", err)
+			}
+			defer fs.CheckClose(in, &err)
+			decoder := json.NewDecoder(in)
+			err = decoder.Decode(&info)
+			if err != nil {
+				return info, true, fmt.Errorf("vfs cache item corrupt metadata: %w", err)
+			}
+
+			infoByte, err := json.Marshal(item.info)
+			if err != nil {
+				return info, true, fmt.Errorf("vfs cache item corrupt metadata: %w", err)
+			}
+
+			err = sqlcache.UpsertMeta(item.name, fs.EntryObject, infoByte)
+			if err != nil {
+				return info, true, fmt.Errorf("vfs cache item corrupt metadata: %w", err)
+			}
+
+			return info, true, nil
+		}
+
+		return info, true, err
+	}
+
+	err = json.Unmarshal(metaInfo.Info, &item.info)
+	if err != nil {
+		return info, true, fmt.Errorf("vfs cache item corrupt metadata: %w", err)
+	}
+
+	return info, true, nil
 }
 
 // save writes an item to the disk
 //
 // call with the lock held
 func (item *Item) _save() (err error) {
-	osPathMeta := item.c.toOSPathMeta(item.name) // No locking in Cache
-	out, err := os.Create(osPathMeta)
+	//osPathMeta := item.c.toOSPathMeta(item.name) // No locking in Cache
+	//out, err := os.Create(osPathMeta)
+	//if err != nil {
+	//	return fmt.Errorf("vfs cache item: failed to write metadata: %w", err)
+	//}
+	//defer fs.CheckClose(out, &err)
+	//encoder := json.NewEncoder(out)
+	//encoder.SetIndent("", "\t")
+	//err = encoder.Encode(item.info)
+	//if err != nil {
+	//	return fmt.Errorf("vfs cache item: failed to encode metadata: %w", err)
+	//}
+
+	var json = jsoniter.ConfigCompatibleWithStandardLibrary
+	metaData, err := json.Marshal(item.info)
 	if err != nil {
-		return fmt.Errorf("vfs cache item: failed to write metadata: %w", err)
+		return fmt.Errorf("json marshal item info failed: %w", err)
 	}
-	defer fs.CheckClose(out, &err)
-	encoder := json.NewEncoder(out)
-	encoder.SetIndent("", "\t")
-	err = encoder.Encode(item.info)
+
+	err = sqlcache.UpsertMeta(item.name, fs.EntryObject, metaData)
 	if err != nil {
-		return fmt.Errorf("vfs cache item: failed to encode metadata: %w", err)
+		return fmt.Errorf("vfs cache item: failed to write sqlcache: %w", err)
 	}
+
 	return nil
 }
 
@@ -255,6 +382,11 @@ func (item *Item) _truncate(size int64) (err error) {
 		}
 		if err != nil {
 			return fmt.Errorf("vfs cache: truncate: failed to open cache file: %w", err)
+		}
+
+		err = sqlcache.AddItem(item.name, fs.EntryObject)
+		if err != nil {
+			return fmt.Errorf("failed to add sqlcache directory: %w", err)
 		}
 
 		defer fs.CheckClose(fd, &err)
@@ -846,6 +978,12 @@ func (item *Item) _removeFile(reason string) {
 		}
 	} else {
 		fs.Infof(item.name, "vfs cache: removed cache file as %s", reason)
+
+		err := sqlcache.DeleteItem(item.name, fs.EntryObject)
+		if err != nil {
+			fs.Errorf(item.name, "vfs cache: failed to remove metadata from cache as %s: %v", reason, err)
+		}
+
 	}
 }
 
@@ -853,15 +991,23 @@ func (item *Item) _removeFile(reason string) {
 //
 // call with lock held
 func (item *Item) _removeMeta(reason string) {
-	osPathMeta := item.c.toOSPathMeta(item.name) // No locking in Cache
-	err := os.Remove(osPathMeta)
+	//osPathMeta := item.c.toOSPathMeta(item.name) // No locking in Cache
+	//err := os.Remove(osPathMeta)
+	//if err != nil {
+	//	if !os.IsNotExist(err) {
+	//		fs.Errorf(item.name, "vfs cache: failed to remove metadata from cache as %s: %v", reason, err)
+	//	}
+	//} else {
+	//	fs.Debugf(item.name, "vfs cache: removed metadata from cache as %s", reason)
+	//}
+
+	err := sqlcache.DeleteMeta(item.name, fs.EntryObject)
 	if err != nil {
-		if !os.IsNotExist(err) {
-			fs.Errorf(item.name, "vfs cache: failed to remove metadata from cache as %s: %v", reason, err)
-		}
+		fs.Errorf(item.name, "vfs cache: failed to remove metadata from cache as %s: %v", reason, err)
 	} else {
 		fs.Debugf(item.name, "vfs cache: removed metadata from cache as %s", reason)
 	}
+
 }
 
 // remove the cached file and empty the metadata
@@ -1412,9 +1558,17 @@ func (item *Item) rename(name string, newName string, newObj fs.Object) (err err
 
 	// Rename cache file if it exists
 	err = rename(item.c.toOSPath(name), item.c.toOSPath(newName)) // No locking in Cache
+	if err == nil {
+		err = sqlcache.RenameItem(name, newName)
+	}
 
 	// Rename meta file if it exists
-	err2 := rename(item.c.toOSPathMeta(name), item.c.toOSPathMeta(newName)) // No locking in Cache
+	//err2 := rename(item.c.toOSPathMeta(name), item.c.toOSPathMeta(newName)) // No locking in Cache
+	//if err2 != nil {
+	//	err = err2
+	//}
+
+	err2 := sqlcache.RenameItemMeta(name, newName, fs.EntryObject)
 	if err2 != nil {
 		err = err2
 	}
